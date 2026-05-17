@@ -21,7 +21,6 @@
 .gitattributes text eol=lf
 
 # Binary file types — exclude from text handling and diff
-*.eml binary
 *.png binary
 *.jpg binary
 *.jpeg binary
@@ -29,3 +28,8 @@
 *.pdf binary
 *.zip binary
 *.gz  binary
+
+# RFC 5322 .eml messages are technically text but contain CRLF-terminated
+# headers that MUST NOT be normalized. They're also covered by .gitignore
+# so this rule is defense-in-depth for anyone who briefly stages a sample.
+*.eml -text

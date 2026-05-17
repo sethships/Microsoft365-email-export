@@ -1,0 +1,17 @@
+version: 2
+
+# Keep GitHub Actions (which we pin to SHAs for supply-chain hygiene)
+# fresh. Without this, SHA pinning silently rots — pinned actions never
+# get security or compatibility updates.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - github-actions

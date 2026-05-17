@@ -6,21 +6,27 @@ on:
   pull_request:
     branches: [main]
 
-# Cancel in-flight runs of this workflow on the same ref when a new commit
-# lands. Saves CI minutes during rapid iteration on a PR.
+# Cancel in-flight runs only on pull requests when a new commit is pushed to
+# the same PR. NEVER cancel on `main` — a back-to-back merge sequence must
+# still produce a lint result for every commit that lands on the default
+# branch.
 concurrency:
-  group: lint-${{ github.ref }}
-  cancel-in-progress: true
+  group: lint-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
   psscriptanalyzer:
     name: PSScriptAnalyzer
     # Run on both Windows and Linux to catch platform-specific issues.
     # The script targets Windows but pwsh is cross-platform; cross-OS lint
-    # is cheap insurance.
+    # is cheap insurance and catches `[System.IO.Path]` quirks etc.
     strategy:
       fail-fast: false
       matrix:
@@ -28,19 +34,39 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
+      # Pinned to a full commit SHA (not a floating tag) for supply-chain
+      # hygiene. Dependabot (.github/dependabot.yml) will open PRs to bump
+      # this when upstream cuts new releases.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Cache the installed PSScriptAnalyzer module across runs. PSGallery
+      # installs cost ~30s per OS per run; caching them is a clean win.
+      # The cache key includes the OS and a hand-rolled version so we can
+      # bump it when we want a fresh module.
+      - name: Cache PSScriptAnalyzer
+        id: cache-pssa
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/powershell/Modules/PSScriptAnalyzer
+            ~/Documents/PowerShell/Modules/PSScriptAnalyzer
+          key: pssa-${{ runner.os }}-v1
 
       - name: Install PSScriptAnalyzer
-        shell: pwsh
+        if: steps.cache-pssa.outputs.cache-hit != 'true'
         run: |
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          # `-Force` already bypasses the PSGallery trust prompt, so we do
+          # not need (and should not use) the deprecated
+          # `Set-PSRepository -InstallationPolicy Trusted` from PowerShellGet v2.
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+
+      - name: Show PSScriptAnalyzer version
+        run: |
           Import-Module PSScriptAnalyzer
           (Get-Module PSScriptAnalyzer).Version | Write-Host
 
       - name: Parse-check all PowerShell files
-        shell: pwsh
         run: |
           $files = Get-ChildItem -Recurse -Include *.ps1,*.psm1,*.psd1
           $hadErrors = $false
@@ -48,20 +74,23 @@ jobs:
             $errs = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
               $f.FullName, [ref]$null, [ref]$errs)
+            # GitHub annotation `file=` paths must be workspace-relative,
+            # not absolute, or the annotation silently fails to attach to
+            # the diff.
+            $relPath = [System.IO.Path]::GetRelativePath($PWD.Path, $f.FullName).Replace('\','/')
             if ($errs) {
               $hadErrors = $true
-              Write-Host "::error file=$($f.FullName)::Parse errors:"
+              Write-Host "::error file=$relPath::Parse errors:"
               $errs | ForEach-Object {
                 "  $($_.Extent.StartLineNumber):$($_.Extent.StartColumnNumber)  $($_.Message)" | Write-Host
               }
             } else {
-              "OK: $($f.Name)" | Write-Host
+              "OK: $relPath" | Write-Host
             }
           }
           if ($hadErrors) { exit 1 }
 
       - name: Run PSScriptAnalyzer
-        shell: pwsh
         run: |
           $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity @('Error','Warning','Information')
           if (-not $results) {
@@ -75,20 +104,31 @@ jobs:
             Out-String -Width 200 | Write-Host
 
           # Emit GitHub annotations so findings appear inline on the diff.
+          # `file=` must be workspace-relative — `ScriptName` is just the
+          # leaf filename, so we resolve `ScriptPath` (absolute) against
+          # the workspace root.
           foreach ($r in $results) {
             $level = switch ($r.Severity) {
               'Error'       { 'error' }
               'Warning'     { 'warning' }
               default       { 'notice' }
             }
+            $path = if ($r.ScriptPath) {
+              [System.IO.Path]::GetRelativePath($PWD.Path, $r.ScriptPath).Replace('\','/')
+            } else {
+              $r.ScriptName
+            }
             $msg = "$($r.RuleName): $($r.Message)" -replace "`r?`n", ' '
-            "::$level file=$($r.ScriptName),line=$($r.Line),col=$($r.Column)::$msg" | Write-Host
+            "::$level file=$path,line=$($r.Line),col=$($r.Column)::$msg" | Write-Host
           }
 
-          # Gate: fail on any Error-severity finding. Warnings are surfaced
-          # as annotations but do not break the build (so we don't block PRs
-          # on style-only findings until we've curated a SuppressedRules
-          # list deliberately).
+          # Gate: fail on any `Error`-severity PSScriptAnalyzer finding.
+          # NOTE: in PSSA, `Error` is a rule-severity classification (e.g.
+          # PSAvoidUsingPlainTextForPassword) — NOT a parse failure. Raw
+          # parse failures are caught by the separate `Parser::ParseFile`
+          # step above. Warnings are surfaced as annotations but do not
+          # break the build until we've deliberately curated a
+          # SuppressedRules list.
           $errorCount = ($results | Where-Object Severity -eq 'Error' | Measure-Object).Count
           $warnCount  = ($results | Where-Object Severity -eq 'Warning' | Measure-Object).Count
           Write-Host "Findings: $errorCount error, $warnCount warning, $($results.Count - $errorCount - $warnCount) information"

@@ -1,0 +1,31 @@
+# Normalize text files to LF in the repo; let the working tree use the
+# platform-native line ending on checkout. This stops the
+# "LF will be replaced by CRLF the next time Git touches it" warnings
+# without forcing CRLF onto Linux/macOS contributors.
+* text=auto eol=lf
+
+# PowerShell is happy with either CRLF or LF on Windows. Keep LF in the
+# repo; checkout converts to CRLF on Windows via core.autocrlf if set,
+# but does not require it.
+*.ps1   text eol=lf diff=powershell
+*.psd1  text eol=lf diff=powershell
+*.psm1  text eol=lf diff=powershell
+*.ps1xml text eol=lf
+
+# Docs / config
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# Binary file types — exclude from text handling and diff
+*.eml binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary
+*.gz  binary

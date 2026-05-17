@@ -1,0 +1,98 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs of this workflow on the same ref when a new commit
+# lands. Saves CI minutes during rapid iteration on a PR.
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  psscriptanalyzer:
+    name: PSScriptAnalyzer
+    # Run on both Windows and Linux to catch platform-specific issues.
+    # The script targets Windows but pwsh is cross-platform; cross-OS lint
+    # is cheap insurance.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Import-Module PSScriptAnalyzer
+          (Get-Module PSScriptAnalyzer).Version | Write-Host
+
+      - name: Parse-check all PowerShell files
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.psm1,*.psd1
+          $hadErrors = $false
+          foreach ($f in $files) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $f.FullName, [ref]$null, [ref]$errs)
+            if ($errs) {
+              $hadErrors = $true
+              Write-Host "::error file=$($f.FullName)::Parse errors:"
+              $errs | ForEach-Object {
+                "  $($_.Extent.StartLineNumber):$($_.Extent.StartColumnNumber)  $($_.Message)" | Write-Host
+              }
+            } else {
+              "OK: $($f.Name)" | Write-Host
+            }
+          }
+          if ($hadErrors) { exit 1 }
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity @('Error','Warning','Information')
+          if (-not $results) {
+            Write-Host "No PSScriptAnalyzer findings."
+            return
+          }
+
+          # Print a human-readable table so PR reviewers can scan results in the log.
+          $results | Sort-Object Severity, ScriptName, Line |
+            Format-Table -AutoSize Severity, ScriptName, Line, RuleName, Message |
+            Out-String -Width 200 | Write-Host
+
+          # Emit GitHub annotations so findings appear inline on the diff.
+          foreach ($r in $results) {
+            $level = switch ($r.Severity) {
+              'Error'       { 'error' }
+              'Warning'     { 'warning' }
+              default       { 'notice' }
+            }
+            $msg = "$($r.RuleName): $($r.Message)" -replace "`r?`n", ' '
+            "::$level file=$($r.ScriptName),line=$($r.Line),col=$($r.Column)::$msg" | Write-Host
+          }
+
+          # Gate: fail on any Error-severity finding. Warnings are surfaced
+          # as annotations but do not break the build (so we don't block PRs
+          # on style-only findings until we've curated a SuppressedRules
+          # list deliberately).
+          $errorCount = ($results | Where-Object Severity -eq 'Error' | Measure-Object).Count
+          $warnCount  = ($results | Where-Object Severity -eq 'Warning' | Measure-Object).Count
+          Write-Host "Findings: $errorCount error, $warnCount warning, $($results.Count - $errorCount - $warnCount) information"
+          if ($errorCount -gt 0) {
+            Write-Error "$errorCount PSScriptAnalyzer error(s) found."
+            exit 1
+          }

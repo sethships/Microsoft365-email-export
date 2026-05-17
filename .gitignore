@@ -1,0 +1,30 @@
+# Export output (potentially huge, contains personal email)
+export/
+out/
+*.eml
+
+# State + manifest from local runs
+.export-state
+manifest.jsonl
+errors.jsonl
+
+# Secrets
+.env
+*.env
+*.pfx
+*.key
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vs/
+.vscode/
+*.swp
+*.swo
+
+# PowerShell module cache (if anything gets installed locally)
+PSModules/

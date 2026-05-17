@@ -149,7 +149,7 @@ For large mailboxes, expect intermittent waits — that's normal. Don't run mult
 
 ## License
 
-[MIT](LICENSE) © 2026 Seth ([github.com/sethships](https://github.com/sethships)).
+[MIT](LICENSE) © 2026 Seth Bibler ([github.com/sethships](https://github.com/sethships)).
 
 ## Code Statistics
 

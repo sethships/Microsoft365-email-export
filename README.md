@@ -24,11 +24,23 @@ This script is the "custom Graph MIME exporter" approach: it returns the exact s
 From the project root:
 
 ```powershell
-# Default: exports to ./export/ relative to the script
+# Default: exports to ./export/ (default tenant audience: 'organizations',
+# so only work/school M365 accounts can sign in)
 pwsh -File .\Export-M365Mail.ps1
+
+# Recommended for the most reliable sign-in UX on Windows
+pwsh -File .\Export-M365Mail.ps1 -UseDeviceCode
 
 # Export to an external drive
 pwsh -File .\Export-M365Mail.ps1 -OutputRoot 'D:\MailArchive\me'
+
+# Pin sign-in to a specific tenant by domain or GUID (helps when you have
+# accounts in multiple tenants)
+pwsh -File .\Export-M365Mail.ps1 -UseDeviceCode -TenantId 'contoso.onmicrosoft.com'
+
+# Export a personal outlook.com / hotmail.com mailbox (overrides default
+# 'organizations' tenant which blocks personal MSA accounts)
+pwsh -File .\Export-M365Mail.ps1 -UseDeviceCode -TenantId 'common'
 
 # Include hidden folders (rarely needed)
 pwsh -File .\Export-M365Mail.ps1 -IncludeHiddenFolders
@@ -37,7 +49,25 @@ pwsh -File .\Export-M365Mail.ps1 -IncludeHiddenFolders
 pwsh -File .\Export-M365Mail.ps1 -PageSize 25
 ```
 
-On first run, a browser window opens for sign-in and consent. After that, the SDK caches a token; subsequent runs sign you in silently until the token expires.
+### Parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `-OutputRoot` | `./export/` | Directory to write `.eml` files, `manifest.jsonl`, `errors.jsonl`, and `.export-state` |
+| `-IncludeHiddenFolders` | off | Walk hidden folders too (system folders) |
+| `-PageSize` | 50 | Messages per Graph page (1–1000) — smaller pages reduce throttle risk |
+| `-UseDeviceCode` | off | Use the OAuth device-code flow instead of the default interactive WAM/browser flow |
+| `-TenantId` | `organizations` | Audience for sign-in: `organizations` (work/school), `common` (any), `consumers` (personal-only), a tenant GUID, or a domain |
+
+### Sign-in flows
+
+**Default (interactive, no flags)**: relies on `Connect-MgGraph -Scopes Mail.Read`. On Windows this opens the native Windows Account Manager (WAM) dialog (the same one Office uses) or a browser tab. WAM has a hard 120-second sign-in timeout, so if your 2FA prompt takes longer (e.g., waiting for an authenticator code on another device), it will fail. The dialog can also be hidden behind other windows.
+
+**`-UseDeviceCode` (recommended)**: prints a URL and a short code straight into the PowerShell window. Open the URL in any browser, enter the code, sign in. No time pressure during 2FA, no hidden dialog. The script polls the OAuth endpoint until you complete sign-in (or the code expires after 15 minutes).
+
+If your browser is already signed into a personal Microsoft account via SSO/cookies and is "hijacking" the sign-in away from your work account, **complete the device-code sign-in in an InPrivate / Incognito browser window** so the browser has no cached Microsoft cookies. The default `-TenantId organizations` setting also rejects personal accounts at the endpoint level, which forces the sign-in page to ask for a work email.
+
+Tokens acquired by `-UseDeviceCode` are not cached across script runs (by design — keeps the script's footprint zero on disk for secrets). Each fresh launch with `-UseDeviceCode` requires a new sign-in. The default flow does cache via the Graph SDK's MSAL cache.
 
 ## Output structure
 
@@ -112,9 +142,10 @@ For large mailboxes, expect intermittent waits — that's normal. Don't run mult
 - **Delegated auth only.** Exports the signed-in user's mailbox. To export someone else's mailbox or run unattended, you'd need to register your own Entra app with app-only `Mail.Read` permission and an `ApplicationAccessPolicy`. Not in scope for v1.
 - **No calendar/contacts/tasks.** Only mail messages.
 - **No attachments-as-separate-files.** Attachments are inside the `.eml` (which is correct — that's the whole point of MIME). If you need them as loose files, parse the `.eml` afterward with any MIME library.
-- **Search Folders are skipped.** They're virtual references; their messages live in real folders and would be duplicates.
+- **Search Folders are skipped** by display name. Works for English mailboxes; non-English mailboxes (where the folder might be e.g. "Suchordner") would need an extra entry in `$Script:SkipDisplayNames`. The proper `wellKnownName` field exists only on the Graph `/beta` endpoint, which we deliberately don't use.
 - **Long paths.** The script sanitizes and length-caps each path segment, but very deep folder trees on Windows without long-path support could still hit the 260-char limit. Enable long-path support or use a shorter `OutputRoot`.
 - **No parallelism.** Single-threaded by design — simpler, easier to debug, and avoids self-throttling.
+- **No refresh-token caching.** Each `-UseDeviceCode` run requires a fresh sign-in. Could be added by encrypting the refresh token with DPAPI under `%LOCALAPPDATA%\Outlook-to-eml\` if frequent re-runs become a pain.
 
 ## License
 
@@ -124,8 +155,8 @@ Internal/personal use. No license granted for redistribution.
 
 | Language | files | blank | comment | code |
 | :--- | ---: | ---: | ---: | ---: |
-| PowerShell | 1 | 80 | 88 | 416 |
-| Markdown | 1 | 38 | 0 | 87 |
-| **SUM** | **2** | **118** | **88** | **503** |
+| PowerShell | 1 | 95 | 177 | 511 |
+| Markdown | 1 | 48 | 0 | 114 |
+| **SUM** | **2** | **143** | **177** | **625** |
 
-*Generated with `cloc --vcs=git --md .` against the working tree on 2026-05-16, immediately before the initial commit. Rerun after material changes.*
+*Generated with `cloc --vcs=git --md .` against the working tree on 2026-05-16, after the auth + state-handling fixes that followed end-to-end testing. Rerun after material changes.*

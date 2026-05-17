@@ -29,13 +29,53 @@
     Page size for the messages list call. Default 50. Max 1000 per Graph spec,
     but smaller pages reduce memory and throttle risk.
 
+.PARAMETER UseDeviceCode
+    Authenticate with the OAuth 2.0 device-code flow instead of the default
+    interactive (WAM / browser) flow. The script prints a URL and a short code
+    that you open on any device to complete sign-in. Useful when:
+      - The interactive WAM dialog gets dismissed or times out during 2FA
+      - You're running over SSH / from a non-interactive session
+      - You'd rather complete sign-in on a phone or a different machine
+
+.PARAMETER TenantId
+    Which Entra ID audience the sign-in should target. Accepts:
+      - 'organizations' (DEFAULT) — any work/school account; personal
+        Microsoft accounts (outlook.com, hotmail.com etc.) are rejected.
+        Pick this if your mailbox is M365 work/school.
+      - 'common'                 — accepts both work/school and personal
+        accounts. Use this only if you genuinely want to export a
+        personal outlook.com mailbox.
+      - 'consumers'              — personal accounts only.
+      - A tenant GUID            — pins sign-in to one specific tenant.
+        Example: 'a1b2c3d4-1111-2222-3333-444444444444'
+      - A verified domain name   — same effect as a GUID for that tenant.
+        Example: 'contoso.onmicrosoft.com'
+
+    Setting this prevents browser-cached personal-account SSO from hijacking
+    the sign-in: if 'organizations' is set, the auth endpoint forces the
+    browser to prompt for a work/school account fresh.
+
 .EXAMPLE
     pwsh -File .\Export-M365Mail.ps1
-    Export the signed-in user's full mailbox to ./export/.
+    Export the signed-in user's full M365 mailbox to ./export/ (default
+    audience is 'organizations' — personal Microsoft accounts are blocked).
 
 .EXAMPLE
     pwsh -File .\Export-M365Mail.ps1 -OutputRoot 'D:\MailArchive\me'
     Export to an external path.
+
+.EXAMPLE
+    pwsh -File .\Export-M365Mail.ps1 -UseDeviceCode
+    Use device-code sign-in — no time pressure for 2FA, completes on any browser.
+
+.EXAMPLE
+    pwsh -File .\Export-M365Mail.ps1 -UseDeviceCode -TenantId 'contoso.onmicrosoft.com'
+    Pin sign-in to one specific tenant (handy when you have accounts in
+    several tenants and need to disambiguate).
+
+.EXAMPLE
+    pwsh -File .\Export-M365Mail.ps1 -UseDeviceCode -TenantId 'common'
+    Export a personal outlook.com / hotmail.com mailbox.
 
 .NOTES
     Requires the Microsoft.Graph.Authentication PowerShell module.
@@ -46,7 +86,9 @@ param(
     [string] $OutputRoot = (Join-Path $PSScriptRoot 'export'),
     [switch] $IncludeHiddenFolders,
     [ValidateRange(1, 1000)]
-    [int]    $PageSize = 50
+    [int]    $PageSize = 50,
+    [switch] $UseDeviceCode,
+    [string] $TenantId = 'organizations'
 )
 
 Set-StrictMode -Version 3.0
@@ -127,7 +169,12 @@ function Get-ShortHash {
 function Get-FileSha256 {
     [OutputType([string])]
     param([Parameter(Mandatory)] [string] $Path)
-    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Use -LiteralPath, not -Path. Subjects routinely contain bracket
+    # characters ([Newsletter], [ACTION REQUIRED], etc.) which Path treats
+    # as wildcard character classes — for a filename containing literal
+    # brackets, that wildcard pattern matches zero files and Get-FileHash
+    # returns nothing, then .Hash explodes under StrictMode 3.
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Build-MessageFileName {
@@ -245,6 +292,114 @@ function Invoke-GraphWithRetry {
 }
 
 # ---------------------------------------------------------------------------
+# Helpers — manual OAuth device code flow
+#
+# Why we don't just use `Connect-MgGraph -UseDeviceCode`: on PowerShell 7
+# with Microsoft.Graph 2.x, the SDK's device-code prompt is delivered through
+# a host UI mechanism that silently fails to print in several common console
+# configurations (transcribed sessions, spawned consoles, terminals where
+# Console.Out isn't the same handle as the PS host). The cmdlet then sits
+# waiting for input that the user can't see, and eventually times out with
+# "Authentication timed out after 120 seconds due to inactivity."
+#
+# We work around this by driving the v2.0 device-code endpoints ourselves,
+# printing the prompt via our own Write-Host (which we know reaches the
+# transcript and the console reliably), then handing the resulting access
+# token to Connect-MgGraph via -AccessToken.
+# ---------------------------------------------------------------------------
+
+# Microsoft Graph PowerShell multi-tenant first-party app id. This is the
+# same client id Connect-MgGraph uses by default, so consent and scopes
+# behave identically to the SDK's own flow.
+$Script:GraphPwshClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+
+function Get-DeviceCodeAccessToken {
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Scope,
+        [Parameter(Mandatory)] [string] $TenantSegment
+    )
+
+    $deviceUri = "https://login.microsoftonline.com/$TenantSegment/oauth2/v2.0/devicecode"
+    $tokenUri  = "https://login.microsoftonline.com/$TenantSegment/oauth2/v2.0/token"
+
+    # Step 1: request a device + user code from the identity platform.
+    try {
+        $dc = Invoke-RestMethod -Method POST -Uri $deviceUri -ContentType 'application/x-www-form-urlencoded' -Body @{
+            client_id = $Script:GraphPwshClientId
+            scope     = $Scope
+        } -ErrorAction Stop
+    } catch {
+        throw "Device-code request failed: $($_.Exception.Message)"
+    }
+
+    # Step 2: print the prompt prominently so the user can see it both on
+    # the console and via Start-Transcript.
+    Write-Host ""
+    Write-Host "===============================================================" -ForegroundColor Yellow
+    Write-Host "  DEVICE CODE SIGN-IN" -ForegroundColor Yellow
+    Write-Host "===============================================================" -ForegroundColor Yellow
+    Write-Host "  1. Open this URL in any browser:" -ForegroundColor White
+    Write-Host "       $($dc.verification_uri)" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  2. Enter this code when prompted:" -ForegroundColor White
+    Write-Host "       $($dc.user_code)" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  3. Sign in with the M365 account you want exported." -ForegroundColor White
+    Write-Host "     Approve the Mail.Read consent on first use." -ForegroundColor White
+    Write-Host ""
+    Write-Host ("  Code expires in {0} minutes. Waiting for sign-in..." -f [Math]::Round($dc.expires_in / 60, 0)) -ForegroundColor DarkGray
+    Write-Host "===============================================================" -ForegroundColor Yellow
+    Write-Host ""
+
+    # Step 3: poll the token endpoint until success, denial, or expiry.
+    $interval = [int] $dc.interval
+    if ($interval -lt 1) { $interval = 5 }
+    $deadline = (Get-Date).AddSeconds([int] $dc.expires_in)
+    $pollBody = @{
+        grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+        client_id   = $Script:GraphPwshClientId
+        device_code = $dc.device_code
+    }
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        try {
+            $tok = Invoke-RestMethod -Method POST -Uri $tokenUri -ContentType 'application/x-www-form-urlencoded' -Body $pollBody -ErrorAction Stop
+            Write-Host "Device code accepted." -ForegroundColor Green
+            return [string] $tok.access_token
+        } catch {
+            # Parse the OAuth error response. PS exposes the body via
+            # ErrorDetails.Message on most platforms; fall back to reading
+            # the response stream where that property is empty.
+            $errBody = $null
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                try { $errBody = $_.ErrorDetails.Message | ConvertFrom-Json } catch { $errBody = $null }
+            }
+            if (-not $errBody -and $_.Exception.Response) {
+                try {
+                    $stream = $_.Exception.Response.GetResponseStream()
+                    $stream.Position = 0
+                    $reader = [System.IO.StreamReader]::new($stream)
+                    $errBody = $reader.ReadToEnd() | ConvertFrom-Json
+                } catch { $errBody = $null }
+            }
+            if (-not $errBody) { throw }
+
+            switch ($errBody.error) {
+                'authorization_pending' { continue }
+                'slow_down'             { $interval += 5; continue }
+                'expired_token'         { throw "Device code expired before sign-in completed." }
+                'access_denied'         { throw "Sign-in was denied by the user." }
+                default                 { throw "Token poll failed: $($errBody.error) — $($errBody.error_description)" }
+            }
+        }
+    }
+    throw "Device code expired before sign-in completed."
+}
+
+# ---------------------------------------------------------------------------
 # Helpers — folder enumeration
 # ---------------------------------------------------------------------------
 
@@ -262,7 +417,12 @@ function Get-AllMailFolders {
         [switch] $IncludeHidden
     )
 
-    $select = '$select=id,displayName,childFolderCount,totalItemCount,wellKnownName'
+    # NOTE: wellKnownName is only available on the /beta endpoint, not /v1.0.
+    # We deliberately omit it here and rely on $Script:SkipDisplayNames to
+    # filter out the "Search Folders" virtual node. This is fine for English
+    # mailboxes; non-English mailboxes may surface the localized search-folder
+    # name (e.g. "Suchordner") and would need an extra entry there.
+    $select = '$select=id,displayName,childFolderCount,totalItemCount'
     $top    = '$top=100'
     $hidden = if ($IncludeHidden) { 'includeHiddenFolders=true' } else { $null }
     $query  = @($select, $top, $hidden) | Where-Object { $_ } | ForEach-Object { $_ } # filter nulls
@@ -305,7 +465,12 @@ function Get-AllMailFolders {
                 Get-AllMailFolders -ParentId ([string] $f['id']) -PathPrefix $path -IncludeHidden:$IncludeHidden
             }
         }
-        $uri = if ($resp.PSObject.Properties.Name -contains '@odata.nextLink') { $resp.'@odata.nextLink' } else { $null }
+        # Invoke-MgGraphRequest returns a Hashtable. ContainsKey() is the
+        # correct test — PSObject.Properties on a Hashtable enumerates the
+        # CLR type's properties (Keys, Values, Count, …), not the dictionary
+        # entries, so the @odata.nextLink key would never be detected and
+        # only page 1 of every collection would be processed.
+        $uri = if ($resp.ContainsKey('@odata.nextLink')) { [string] $resp['@odata.nextLink'] } else { $null }
     }
 }
 
@@ -314,16 +479,21 @@ function Get-AllMailFolders {
 # ---------------------------------------------------------------------------
 
 function Import-CompletedState {
-    [OutputType([System.Collections.Generic.HashSet[string]])]
+    # Returns a Hashtable used as a string set (key = graph message id,
+    # value = $true). Hashtable is chosen over HashSet[string] because
+    # PowerShell's strict-mode-3 PSObject adapter does not expose .Count
+    # on generic HashSet, which causes "property Count cannot be found"
+    # at the first reference. Hashtable.Count is reliable.
+    [OutputType([System.Collections.Hashtable])]
     param([Parameter(Mandatory)] [string] $StatePath)
 
-    $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    if (-not (Test-Path -Path $StatePath -PathType Leaf)) { return $set }
+    $ht = @{}
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { return $ht }
     foreach ($line in [System.IO.File]::ReadLines($StatePath)) {
         $trimmed = $line.Trim()
-        if ($trimmed) { [void] $set.Add($trimmed) }
+        if ($trimmed) { $ht[$trimmed] = $true }
     }
-    return $set
+    return $ht
 }
 
 function Add-CompletedState {
@@ -331,7 +501,7 @@ function Add-CompletedState {
         [Parameter(Mandatory)] [string] $StatePath,
         [Parameter(Mandatory)] [string] $MessageId
     )
-    Add-Content -Path $StatePath -Value $MessageId -Encoding utf8
+    Add-Content -LiteralPath $StatePath -Value $MessageId -Encoding utf8
 }
 
 # ---------------------------------------------------------------------------
@@ -344,7 +514,7 @@ function Write-ManifestEntry {
         [Parameter(Mandatory)] [hashtable] $Entry
     )
     $json = $Entry | ConvertTo-Json -Depth 6 -Compress
-    Add-Content -Path $ManifestPath -Value $json -Encoding utf8
+    Add-Content -LiteralPath $ManifestPath -Value $json -Encoding utf8
 }
 
 function Write-ErrorEntry {
@@ -353,7 +523,7 @@ function Write-ErrorEntry {
         [Parameter(Mandatory)] [hashtable] $Entry
     )
     $json = $Entry | ConvertTo-Json -Depth 6 -Compress
-    Add-Content -Path $ErrorPath -Value $json -Encoding utf8
+    Add-Content -LiteralPath $ErrorPath -Value $json -Encoding utf8
 }
 
 # ---------------------------------------------------------------------------
@@ -365,7 +535,7 @@ function Export-FolderMessages {
     param(
         [Parameter(Mandatory)] $Folder,
         [Parameter(Mandatory)] [string] $OutRoot,
-        [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]] $Completed,
+        [Parameter(Mandatory)] [System.Collections.Hashtable] $Completed,
         [Parameter(Mandatory)] [string] $StatePath,
         [Parameter(Mandatory)] [string] $ManifestPath,
         [Parameter(Mandatory)] [string] $ErrorPath,
@@ -373,7 +543,7 @@ function Export-FolderMessages {
     )
 
     $folderDir = Join-Path -Path $OutRoot -ChildPath $Folder.Path
-    if (-not (Test-Path -Path $folderDir)) {
+    if (-not (Test-Path -LiteralPath $folderDir)) {
         New-Item -ItemType Directory -Path $folderDir -Force | Out-Null
     }
 
@@ -396,7 +566,7 @@ function Export-FolderMessages {
             $count++
             $msgId = [string] $msg['id']
 
-            if ($Completed.Contains($msgId)) {
+            if ($Completed.ContainsKey($msgId)) {
                 $skippedDone++
                 continue
             }
@@ -451,7 +621,7 @@ function Export-FolderMessages {
                 }
                 Write-ManifestEntry -ManifestPath $ManifestPath -Entry $entry
                 Add-CompletedState -StatePath $StatePath -MessageId $msgId
-                [void] $Completed.Add($msgId)
+                $Completed[$msgId] = $true
                 $written++
             } catch {
                 $errors++
@@ -474,7 +644,12 @@ function Export-FolderMessages {
                     $written, $skippedDone, $errors, $rate)
             }
         }
-        $uri = if ($resp.PSObject.Properties.Name -contains '@odata.nextLink') { $resp.'@odata.nextLink' } else { $null }
+        # Invoke-MgGraphRequest returns a Hashtable. ContainsKey() is the
+        # correct test — PSObject.Properties on a Hashtable enumerates the
+        # CLR type's properties (Keys, Values, Count, …), not the dictionary
+        # entries, so the @odata.nextLink key would never be detected and
+        # only page 1 of every collection would be processed.
+        $uri = if ($resp.ContainsKey('@odata.nextLink')) { [string] $resp['@odata.nextLink'] } else { $null }
     }
 
     [pscustomobject] @{
@@ -495,7 +670,9 @@ function Invoke-Main {
     param(
         [Parameter(Mandatory)] [string] $OutputRoot,
         [Parameter(Mandatory)] [bool]   $IncludeHidden,
-        [Parameter(Mandatory)] [int]    $PageSize
+        [Parameter(Mandatory)] [int]    $PageSize,
+        [Parameter(Mandatory)] [bool]   $UseDeviceCode,
+        [Parameter(Mandatory)] [string] $TenantId
     )
 
     # Validate dependencies first — fail fast with a clear message.
@@ -504,10 +681,10 @@ function Invoke-Main {
     }
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
-    if (-not (Test-Path -Path $OutputRoot)) {
+    if (-not (Test-Path -LiteralPath $OutputRoot)) {
         New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
     }
-    $OutputRoot = (Resolve-Path -Path $OutputRoot).Path
+    $OutputRoot = (Resolve-Path -LiteralPath $OutputRoot).Path
 
     $manifestPath = Join-Path -Path $OutputRoot -ChildPath 'manifest.jsonl'
     $errorPath    = Join-Path -Path $OutputRoot -ChildPath 'errors.jsonl'
@@ -519,8 +696,25 @@ function Invoke-Main {
     Write-Host "State       : $statePath"
     Write-Host ""
 
-    Write-Host "Connecting to Microsoft Graph (delegated, scope: Mail.Read)..." -ForegroundColor Cyan
-    Connect-MgGraph -Scopes 'Mail.Read' -NoWelcome | Out-Null
+    $authMode = if ($UseDeviceCode) { 'device code (custom)' } else { 'interactive (WAM/browser)' }
+    Write-Host "Connecting to Microsoft Graph (delegated, scope: Mail.Read; tenant: $TenantId; auth: $authMode)..." -ForegroundColor Cyan
+    if ($UseDeviceCode) {
+        $token = Get-DeviceCodeAccessToken `
+            -Scope         'https://graph.microsoft.com/Mail.Read offline_access' `
+            -TenantSegment $TenantId
+        $secure = ConvertTo-SecureString $token -AsPlainText -Force
+        Connect-MgGraph -AccessToken $secure -NoWelcome | Out-Null
+    } else {
+        # Connect-MgGraph's -TenantId accepts a GUID or domain. For the
+        # multi-tenant audience aliases ('common', 'organizations',
+        # 'consumers') we omit -TenantId because the SDK will pick the
+        # right authority itself based on its built-in defaults.
+        $connectArgs = @{ Scopes = 'Mail.Read'; NoWelcome = $true }
+        if ($TenantId -notin 'common','organizations','consumers') {
+            $connectArgs['TenantId'] = $TenantId
+        }
+        Connect-MgGraph @connectArgs | Out-Null
+    }
 
     $ctx = Get-MgContext
     if (-not $ctx) {
@@ -578,7 +772,12 @@ function Invoke-Main {
 }
 
 try {
-    Invoke-Main -OutputRoot $OutputRoot -IncludeHidden $IncludeHiddenFolders.IsPresent -PageSize $PageSize
+    Invoke-Main `
+        -OutputRoot     $OutputRoot `
+        -IncludeHidden  $IncludeHiddenFolders.IsPresent `
+        -PageSize       $PageSize `
+        -UseDeviceCode  $UseDeviceCode.IsPresent `
+        -TenantId       $TenantId
 } finally {
     try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
 }

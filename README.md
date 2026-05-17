@@ -1,4 +1,4 @@
-# Outlook-to-eml
+# Microsoft365-email-export
 
 A small PowerShell 7 script that bulk-exports your Microsoft 365 (Outlook) mailbox to individual `.eml` files via Microsoft Graph.
 
